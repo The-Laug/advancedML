@@ -189,7 +189,7 @@ if __name__ == "__main__":
     # Parse arguments
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'eval'], help='what to do when running the script (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
@@ -260,3 +260,14 @@ if __name__ == "__main__":
         with torch.no_grad():
             samples = (model.sample(64)).cpu() 
             save_image(samples.view(64, 1, 28, 28), args.samples)
+    
+    elif args.mode == 'eval':
+        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+
+        # Evaluate model
+        model.eval()
+        with torch.no_grad():
+            elbo = 0
+            for x in mnist_test_loader:
+                x = x[0].to(device)
+                elbo += model.elbo(x).item()
