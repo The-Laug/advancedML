@@ -271,3 +271,4 @@ if __name__ == "__main__":
             for x in mnist_test_loader:
                 x = x[0].to(device)
                 elbo += model.elbo(x).item()
+                
