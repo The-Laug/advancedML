@@ -7,6 +7,7 @@ import torch.distributions as td
 import torch.nn.functional as F
 from tqdm import tqdm
 from unet import Unet
+from fid import compute_fid
 
 
 class DDPM(nn.Module):
@@ -124,17 +125,21 @@ def train(model, optimizer, data_loader, epochs, device):
 
     for epoch in range(epochs):
         data_iter = iter(data_loader)
-        for x in data_iter:
+        for batch_idx, x in enumerate(data_iter):
             if isinstance(x, (list, tuple)):
                 x = x[0]
             x = x.to(device)
             optimizer.zero_grad()
             loss = model.loss(x)
             loss.backward()
+            
+            # Check gradient flow
+            max_grad = max([p.grad.abs().max().item() for p in model.parameters() if p.grad is not None])
+            
             optimizer.step()
 
             # Update progress bar
-            progress_bar.set_postfix(loss=f"⠀{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}")
+            progress_bar.set_postfix(loss=f"⠀{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}", max_grad=f"{max_grad:.2e}")
             progress_bar.update()
 
 
@@ -179,11 +184,12 @@ if __name__ == "__main__":
     # Parse arguments
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'test'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'test', 'fid'], help='what to do when running the script (default: %(default)s)')
     parser.add_argument('--data', type=str, default='tg', choices=['tg', 'cb', 'mnist'], help='dataset to use {tg: two Gaussians, cb: chequerboard} (default: %(default)s)')
     parser.add_argument('--network', type=str, default='unet', choices=['unet', 'fcnetwork'], help='network architecture to use {unet: convolutional U-Net, fcnetwork: fully connected} (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
+    parser.add_argument('--classifier', type=str, default='mnist_classifier.pth', help='path to classifier checkpoint for FID evaluation (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=10000, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N', help='number of epochs to train (default: %(default)s)')
@@ -291,3 +297,61 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig(args.samples)
         plt.close()
+
+    elif args.mode == 'fid':
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from torchvision import datasets, transforms
+
+        # Load the model
+        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        model.eval()
+
+        # Generate samples
+        with torch.no_grad():
+            samples = model.sample((1000, D)).cpu() 
+
+        # Reverse transformation: from [-1, 1] back to [0, 1]
+        samples = samples / 2.0 + 0.5
+        
+        # Reshape from flattened (784) to images (1, 28, 28)
+        samples = samples.reshape(-1, 1, 28, 28)
+        
+        # Clip to valid range
+        samples = torch.clamp(samples, 0, 1)
+        
+        # Rescale back to [-1, 1] for FID computation
+        samples_fid = (samples - 0.5) * 2.0
+
+        # Load real test data with proper transform for FID
+        transform_fid = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: x + torch.rand(x.shape) / 255),
+            transforms.Lambda(lambda x: (x - 0.5) * 2.0),
+        ])
+        
+        mnist_test_data = datasets.MNIST(
+            root='data/',
+            train=False,
+            download=True,
+            transform=transform_fid
+        )
+        
+        # Get first 1000 real test samples
+        real_samples = []
+        for i in range(min(1000, len(mnist_test_data))):
+            real_samples.append(mnist_test_data[i][0])
+        real_samples = torch.stack(real_samples).to(args.device)
+
+        # Move generated samples to device
+        samples_fid = samples_fid.to(args.device)
+
+        # Compute FID
+        fid_score = compute_fid(
+            real_samples,
+            samples_fid,
+            device=args.device,
+            classifier_ckpt=args.classifier
+        )
+        
+        print(f"\nFID Score: {fid_score:.4f}")
