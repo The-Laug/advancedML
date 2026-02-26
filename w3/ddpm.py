@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.distributions as td
 import torch.nn.functional as F
 from tqdm import tqdm
+from unet import Unet
 
 
 class DDPM(nn.Module):
@@ -180,6 +181,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'test'], help='what to do when running the script (default: %(default)s)')
     parser.add_argument('--data', type=str, default='tg', choices=['tg', 'cb', 'mnist'], help='dataset to use {tg: two Gaussians, cb: chequerboard} (default: %(default)s)')
+    parser.add_argument('--network', type=str, default='unet', choices=['unet', 'fcnetwork'], help='network architecture to use {unet: convolutional U-Net, fcnetwork: fully connected} (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
@@ -238,9 +240,12 @@ if __name__ == "__main__":
     # Set the number of steps in the diffusion process
     T = 1000
     
-    # Define the network
-    num_hidden = 64
-    network = FcNetwork(D, num_hidden,T=T)
+    # Define the network based on CLI argument
+    if args.network == 'unet':
+        network = Unet()
+    else:  # fcnetwork
+        num_hidden = 64
+        network = FcNetwork(D, num_hidden, T=T)
 
 
     # Define model
