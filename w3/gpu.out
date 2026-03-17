@@ -1,0 +1,5 @@
+usage: ddpm.py [-h] [--data {tg,cb,mnist}] [--model MODEL] [--samples SAMPLES]
+               [--device {cpu,cuda,mps}] [--batch-size N] [--epochs N]
+               [--lr V]
+               {train,sample,test}
+ddpm.py: error: argument --epochs: expected one argument
