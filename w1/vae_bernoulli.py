@@ -34,7 +34,46 @@ class GaussianPrior(nn.Module):
         prior: [torch.distributions.Distribution]
         """
         return td.Independent(td.Normal(loc=self.mean, scale=self.std), 1)
+    
+class MixtureOfGaussianPrior(nn.Module):
+    def __init__(self, M):
+        """
+        Define a Gaussian prior distribution with zero mean and unit variance.
 
+                Parameters:
+        M: [int] 
+           Dimension of the latent space.
+        """
+        super(MixtureOfGaussianPrior, self).__init__()
+        self.M = M
+        # Number of mixture components (default 10, can be changed later)
+        self.K = 10
+
+        # Mixture logits (initialized uniform). Learnable so the model can
+        # adapt mixture weights if desired.
+        self.mixture_logits = nn.Parameter(torch.zeros(self.K))
+
+        # Component means and log-scales (K x M). Make learnable so the
+        # prior can adapt during training.
+        self.means = nn.Parameter(torch.randn(self.K, self.M) * 0.01)
+        self.log_scales = nn.Parameter(torch.zeros(self.K, self.M))
+
+    def forward(self):
+        """
+        Return a torch.distributions.MixtureSameFamily instance representing
+        a K-component factorized Gaussian prior over the M-dimensional latent.
+
+        Returns:
+        prior: [torch.distributions.Distribution]
+        """
+        # Categorical over components
+        mix = td.Categorical(logits=self.mixture_logits)
+
+        # Component distribution: batch_shape=(K,), event_shape=(M,)
+        comp = td.Independent(td.Normal(loc=self.means, scale=torch.exp(self.log_scales)), 1)
+
+        mixture = td.MixtureSameFamily(mixture_distribution=mix, component_distribution=comp)
+        return mixture
 
 class GaussianEncoder(nn.Module):
     def __init__(self, encoder_net):
@@ -121,7 +160,16 @@ class VAE(nn.Module):
         """
         q = self.encoder(x)
         z = q.rsample()
-        elbo = torch.mean(self.decoder(z).log_prob(x) - td.kl_divergence(q, self.prior()), dim=0)
+
+        # Use Monte-Carlo estimate for KL: KL(q||p) = E_q[log q(z) - log p(z)].
+        # This works for any prior p that implements log_prob (including MoG).
+        log_qz = q.log_prob(z)
+        p = self.prior()
+        log_pz = p.log_prob(z)
+        kl_est = log_qz - log_pz
+
+        recon_logprob = self.decoder(z).log_prob(x)
+        elbo = torch.mean(recon_logprob - kl_est, dim=0)
         return elbo
 
     def sample(self, n_samples=1):
@@ -181,6 +229,58 @@ def train(model, optimizer, data_loader, epochs, device):
             progress_bar.update()
 
 
+def plot_latent_samples(model: VAE, data_loader: torch.utils.data.DataLoader, n: int = 1500):
+    model.eval()
+    device = next(model.parameters()).device
+    zs_list = []
+    labels_list = []
+    collected = 0
+
+    import sklearn.decomposition as dec
+    import sklearn.manifold as manifold
+    import matplotlib.pyplot as plt
+
+    with torch.no_grad():
+        for images, labels in data_loader:
+            images = images.to(device)
+            latent = model.encoder(images)
+
+            # extract mean (robust to Independent wrappers)
+            if hasattr(latent, "loc"):
+                z_batch = latent.loc.cpu().numpy()
+            elif hasattr(latent, "base_dist") and hasattr(latent.base_dist, "loc"):
+                z_batch = latent.base_dist.loc.cpu().numpy()
+            else:
+                mean_attr = getattr(latent, "mean", None)
+                if callable(mean_attr):
+                    z_batch = mean_attr().cpu().numpy()
+                elif mean_attr is not None:
+                    z_batch = mean_attr.cpu().numpy()
+                else:
+                    z_batch = latent.sample().cpu().numpy()
+
+            zs_list.append(z_batch)
+            labels_list.append(labels.cpu().numpy())
+            collected += z_batch.shape[0]
+            if collected >= n:
+                break
+
+    zs = np.concatenate(zs_list, axis=0)[:n]
+    labels = np.concatenate(labels_list, axis=0)[:n]
+
+    # z2 = dec.PCA(2).fit_transform(zs)  # (n, 2)
+    #Using TSNE
+    z2 = manifold.TSNE(2).fit_transform(zs)  # (n, 2)
+    plt.figure(figsize=(8, 6))
+    scatter = plt.scatter(z2[:, 0], z2[:, 1], c=labels, cmap='tab10', alpha=0.7)
+    plt.colorbar(scatter, ticks=range(10))
+    plt.xlabel('T-SNE Component 1')
+    plt.ylabel('T-SNE Component 2')
+    plt.title(f'T-SNE of {n} Latent Representations Colored by Digit Class')
+    plt.show()
+    plt.savefig('tsne_latent_space.png')
+
+
 if __name__ == "__main__":
     from torchvision import datasets, transforms
     from torchvision.utils import save_image, make_grid
@@ -188,14 +288,16 @@ if __name__ == "__main__":
 
     # Parse arguments
     import argparse
+    import numpy as np
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'eval'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample', 'eval','plot'], help='what to do when running the script (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
+    parser.add_argument('--prior', type=str, default='gauss', choices=['gauss', 'mog'], help='prior type: gaussian (gauss) or mixture of gaussians (mog)')
 
     args = parser.parse_args()
     print('# Options')
@@ -215,7 +317,10 @@ if __name__ == "__main__":
 
     # Define prior distribution
     M = args.latent_dim
-    prior = GaussianPrior(M)
+    Gprior = GaussianPrior(M)
+    MoGPrior = MixtureOfGaussianPrior(M)
+
+    prior = Gprior if args.prior == 'gauss' else MoGPrior
 
     # Define encoder and decoder networks
     encoder_net = nn.Sequential(
@@ -261,6 +366,10 @@ if __name__ == "__main__":
             samples = (model.sample(64)).cpu() 
             save_image(samples.view(64, 1, 28, 28), args.samples)
     
+    elif args.mode == 'plot':
+        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        plot_latent_samples(model,data_loader=mnist_train_loader)
+
     elif args.mode == 'eval':
         model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
 
@@ -271,4 +380,3 @@ if __name__ == "__main__":
             for x in mnist_test_loader:
                 x = x[0].to(device)
                 elbo += model.elbo(x).item()
-                
